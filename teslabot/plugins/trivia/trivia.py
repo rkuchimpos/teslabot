@@ -6,10 +6,12 @@ from math import ceil
 from pluginbase import PluginBase
 from questions import load_questions
 
+import time
 import logging
 import re
 import random
 import os.path
+import json
 from config import Config, ConfigParser
 
 
@@ -37,19 +39,22 @@ class Trivia(PluginBase):
         # Number of 5 second intervals between asking a question or giving a hint
         self.askpause = 2
         # Default number of questions to ask in a round
-        self.defaultnumquestions = 10
+        self.defaultnumquestions = 20
 
-        self.startingmsg = u"Trivia starting. Questions: {0}"
-        self.stoppingmsg = u"Trivia stopping."
-        self.questionmsg = u"Q{2}. [{0}] {1}"
-        self.okanswermsg = u"{0} got it for {1} points. Total: {2}, streak: {3}. " \
-                           + u"Answer: {4}"
-        self.noanswermsg = u"No one got it. The answer was: {0}"
+        self.startingmsg = u"Starting round of trivia. Questions: {0}"
+        self.stoppingmsg = u""
+        self.questionmsg = u"{2}. {0}: {1}"
+        self.okanswermsg = u"Winner: {0}; Answer: {4}; Time: {5}s; Streak: {3}; " \
+                           + u"Points: {1}; Total: {2}"
+        self.noanswermsg = u"Time's up! The answer was: {0}"
         self.rankingsmsg = u"{0} wins! Final scores: {1}"
         self.skippingmsg = u'Skipping this terrible question.'
         self.nextvotemsg = u'{0} voted to skip this question. {1} more votes needed.'
         self.roundendmsg = u"Round of trivia complete. '.trivia [number]' to start " \
                            + u"playing again."
+
+        self.overallrankmsg = u"{0} is currently ranked #{1} with {2} points, {3} points behind {4}."
+        self.overallrankmsg_alt = u"{0} is currently ranked #{1} with {2} points."
 
         self.questions = load_questions(os.path.abspath('plugins/trivia'))
         self.logger.info("Loaded {0} trivia questions.".format(len(self.questions)))
@@ -62,9 +67,11 @@ class Trivia(PluginBase):
         self.q = random.choice(self.questions)
         self.qcount = 0
         self.hintlevel = 0
-        self.scores = {}  # Key: nick, value: points scored this round
+        self.scores = self.load_scores()
         self.streak = [None, 0]  # [nick, streak] (Would be a tuple but they're immutable)
         self.nextvotes = []  # List of nicks who've voted to skip the current question
+        self.qstarttime = 0
+        self.qendtime = 0
 
     def on_load(self):
         # This function is called before the bot connects to the server
@@ -73,6 +80,33 @@ class Trivia(PluginBase):
 
     def say(self, msg):
         self.irch.say(msg, self.channel)
+
+    def load_scores(self):         
+        dir = os.path.dirname(os.path.abspath(__file__))
+        fileName = "scores.json"
+        filePath = os.path.join(dir, fileName)
+
+        if not os.path.isfile(filePath):
+            return {}
+
+        try:
+            with open(filePath) as f:
+               return json.load(f)
+        except IOError:
+            # TODO: handle file IO error
+            pass
+
+    def save_scores(self):           
+        dir = os.path.dirname(os.path.abspath(__file__))
+        fileName = "scores.json"
+        filePath = os.path.join(dir, fileName)
+
+        try:
+            with open(filePath, "w+") as f:
+                    json.dump(scores, f)
+        except IOError:
+            # TODO: handle file IO error
+            pass
 
     def scores_strs(self, limit=None):
         """ Returns a tuple containing the winner's nick and a string with the scores
@@ -83,19 +117,21 @@ class Trivia(PluginBase):
         scoresstr = ""
         for idx, nick in enumerate(sortedscores):
             if not limit or idx < limit:
-                scoresstr += "{0} {1}; ".format(nick, self.scores[nick])
+                scoresstr += "{0}. {1} {2}; ".format(idx+1, nick, self.scores[nick])
 
         return (winner, scoresstr)
 
     def end_round(self):
         self.unhook(self.ask)
 
-        (winner, scores) = self.scores_strs()
-
-        if winner:
-            self.say(self.rankingsmsg.format(winner, scores))
         self.say(self.roundendmsg)
 
+        self.gamerunning = False
+        self.remainingq = self.defaultnumquestions
+        self.q = random.choice(self.questions)
+        self.qcount = 0
+        self.hintlevel = 0
+        self.save_scores()     
         self.reset()
 
     def next_q(self):
@@ -111,6 +147,7 @@ class Trivia(PluginBase):
     def ask(self):
         """Asks a question or shows a hint."""
         if self.hintlevel == 0:
+            self.qstarttime = time.time()
             self.qcount += 1
             self.hintlevel += 1
 
@@ -172,6 +209,7 @@ class Trivia(PluginBase):
             return
 
         if self.is_correct_answer(msg):
+            self.qendtime = time.time()
             points = 10 - self.hintlevel * 2
 
             if user.nick == self.streak[0]:
@@ -185,11 +223,13 @@ class Trivia(PluginBase):
             else:
                 self.scores[user.nick] = points
 
+            elapsed = self.qendtime - self.qstarttime
             self.say(self.okanswermsg.format(user.nick,
                                              points,
                                              self.scores[user.nick],
                                              self.streak[1],
-                                             self.q.answer.replace('#', '')))
+                                             self.q.answer.replace('#', ''),
+                                             "{0:.2f}".format(elapsed)))
             self.next_q()
 
     # TODO: subcommand for ping
@@ -213,10 +253,24 @@ class Trivia(PluginBase):
 
     def command_tt(self, user, dst, args):
         """Prints top 10 scores."""
-        if self.gamerunning and dst.lower() == self.channel.lower():
-            scores = self.scores_strs(limit=10)[1]
-            if scores != "":
-                self.say(scores)
+        scores = self.scores_strs(limit=10)[1]
+        if scores != "":
+            self.say(scores)
+
+    def command_rank(self, user, dst, args):
+        """Prints user's rank"""
+        if dst.lower() == self.channel.lower():
+            sortedscores = sorted(self.scores, key=self.scores.get, reverse=True)
+            if user.nick not in sortedscores:
+             self.say("{0} is not ranked.".format(user.nick))
+             return
+            idx = sortedscores.index(user.nick)
+            if idx == 0:
+                self.say(self.overallrankmsg_alt.format(user.nick, idx + 1, self.scores[user.nick]))
+            else:
+                playerahead = sortedscores[idx - 1]
+                diff = self.scores[playerahead] - self.scores[user.nick]
+                self.say(self.overallrankmsg.format(user.nick, idx + 1, self.scores[user.nick],diff, playerahead))
 
     def command_trivia(self, user, dst, args):
         """Starts the game."""
